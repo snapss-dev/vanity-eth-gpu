@@ -8,7 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "test": "vitest run",
-    "test:gpu": "node scripts/gpu-test.mjs"
+    "test:gpu": "node scripts/gpu-test.mjs",
+    "icons": "node scripts/build-icons.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.68",

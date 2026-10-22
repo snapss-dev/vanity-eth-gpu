@@ -5,9 +5,14 @@ import { type SearchTarget } from '../searchTarget'
 import { ADDRESS_NIBBLE_LENGTH, calculatePatternDifficulty, mergeAddressPattern } from '../searchPattern'
 import { createSearchController, type Engine, type SearchRequest } from '../search/controller'
 import { chanceFoundByNow, formatDuration, formatNumber, secondsForChance } from './format'
+import iconSvg from '../assets/icon.svg?raw'
 
 const DONATE_ADDRESS = '0x99999933F17A1339958d50b3f59740E5Ad48C74C'
 const DEFAULT_SUBTITLE = 'Fast vanity address generator'
+// The app icon (also the source of the PNG icons), inlined so it never pops in.
+const LOGO_SVG = iconSvg
+  .replace(/<!--[\s\S]*?-->\s*/g, '')
+  .replace('<svg ', '<svg class="logo-mark" aria-hidden="true" focusable="false" ')
 
 type Found = {
   priv: PrivKey32
@@ -54,31 +59,7 @@ async function copyToClipboard(text: string, btn: HTMLButtonElement) {
 export function initApp(root: HTMLDivElement) {
   root.innerHTML = `
     <div class="header">
-      <div class="logo">
-        <svg class="logo-mark" viewBox="0 0 48 48" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-          <!-- Ethereum diamond (the real faceted mark), in white -->
-          <g class="logo-eth">
-            <path d="M20 5 L20 18.7 L29.4 22 Z" fill="#fff" fill-opacity=".62"/>
-            <path d="M20 5 L10.6 22 L20 18.7 Z" fill="#fff" fill-opacity=".95"/>
-            <path d="M20 20.3 L29.4 22 L20 27 Z" fill="#fff" fill-opacity=".45"/>
-            <path d="M20 20.3 L20 27 L10.6 22 Z" fill="#fff" fill-opacity=".80"/>
-            <path d="M20 28.8 L29.4 23.6 L20 38 Z" fill="#fff" fill-opacity=".55"/>
-            <path d="M20 28.8 L20 38 L10.6 23.6 Z" fill="#fff" fill-opacity=".90"/>
-          </g>
-          <!-- Paintbrush, dipped in accent paint, mid-stroke across the mark -->
-          <g class="logo-brush" stroke-linecap="round" stroke-linejoin="round">
-            <path d="M44 13 L34.2 23.6" stroke="#e7ebff" stroke-width="3"/>
-            <path d="M34.4 23.3 L31.2 26.8" stroke="#aab4e6" stroke-width="3.6"/>
-            <path d="M31.4 26.4 C 28.9 28.8, 27.2 31.6, 26.2 34.6 C 29.3 33.8, 32 32.2, 33.9 29.6 Z" fill="#627eea"/>
-          </g>
-          <!-- Paint palette dabs -->
-          <g class="logo-palette">
-            <circle cx="12.5" cy="40.5" r="2.1" fill="#627eea"/>
-            <circle cx="18.2" cy="42" r="2.1" fill="#8fa7ff"/>
-            <circle cx="24" cy="40.5" r="2.1" fill="#fff" fill-opacity=".85"/>
-          </g>
-        </svg>
-      </div>
+      <div class="logo">${LOGO_SVG}</div>
       <h1 class="title">Vanity ETH GPU</h1>
       <div class="subtitle" id="subtitle" aria-live="polite">${DEFAULT_SUBTITLE}</div>
     </div>
