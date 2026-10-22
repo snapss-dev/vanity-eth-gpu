@@ -77,6 +77,3 @@ export async function createKeystoreV3(priv: PrivKey32, password: string): Promi
     },
   }
 }
-
-
-
