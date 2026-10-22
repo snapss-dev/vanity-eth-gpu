@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Vanity ETH GPU: the Ethereum mark on a GPU die. Used for the page header and app icons.
+       icon-small.svg is the pixel-aligned cut used for favicons.
+       PNG icons are generated from this file: npm run images -->
+  <defs>
+    <linearGradient id="vg-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2246"/>
+      <stop offset="1" stop-color="#0b0e1f"/>
+    </linearGradient>
+    <linearGradient id="vg-die" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7d93ff"/>
+      <stop offset="1" stop-color="#4053c9"/>
+    </linearGradient>
+  </defs>
+  <rect class="tile" width="64" height="64" rx="14" fill="url(#vg-tile)"/>
+  <g fill="#8fa7ff">
+    <rect x="20.75" y="5" width="2.5" height="6" rx="1.25"/>
+    <rect x="20.75" y="53" width="2.5" height="6" rx="1.25"/>
+    <rect x="5" y="20.75" width="6" height="2.5" rx="1.25"/>
+    <rect x="53" y="20.75" width="6" height="2.5" rx="1.25"/>
+    <rect x="30.75" y="5" width="2.5" height="6" rx="1.25"/>
+    <rect x="30.75" y="53" width="2.5" height="6" rx="1.25"/>
+    <rect x="5" y="30.75" width="6" height="2.5" rx="1.25"/>
+    <rect x="53" y="30.75" width="6" height="2.5" rx="1.25"/>
+    <rect x="40.75" y="5" width="2.5" height="6" rx="1.25"/>
+    <rect x="40.75" y="53" width="2.5" height="6" rx="1.25"/>
+    <rect x="5" y="40.75" width="6" height="2.5" rx="1.25"/>
+    <rect x="53" y="40.75" width="6" height="2.5" rx="1.25"/>
+  </g>
+  <rect x="11" y="11" width="42" height="42" rx="8" fill="url(#vg-die)"/>
+  <rect x="11.75" y="11.75" width="40.5" height="40.5" rx="7.25" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="1.5"/>
+  <g>
+    <polygon points="32,16 22.18,32.29 32,27.83" fill="#fff"/>
+    <polygon points="32,16 41.82,32.29 32,27.83" fill="#fff" fill-opacity=".72"/>
+    <polygon points="22.18,32.29 32,38.1 32,27.83" fill="#fff" fill-opacity=".55"/>
+    <polygon points="41.82,32.29 32,38.1 32,27.83" fill="#fff" fill-opacity=".38"/>
+    <polygon points="32,39.96 22.18,34.16 32,48" fill="#fff" fill-opacity=".92"/>
+    <polygon points="32,39.96 41.82,34.16 32,48" fill="#fff" fill-opacity=".62"/>
+  </g>
+</svg>

@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <!-- Vanity ETH GPU: the Ethereum mark on a GPU die. Favicon cut: two pins per side stay crisp at 16 px.
+       Geometry sits on a 4-unit grid so pins land on whole pixels at 16/32 px.
+       PNG icons are generated from this file: npm run images -->
+  <defs>
+    <linearGradient id="vg-tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#1b2246"/>
+      <stop offset="1" stop-color="#0b0e1f"/>
+    </linearGradient>
+    <linearGradient id="vg-die" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7d93ff"/>
+      <stop offset="1" stop-color="#4053c9"/>
+    </linearGradient>
+  </defs>
+  <rect class="tile" width="64" height="64" rx="14" fill="url(#vg-tile)"/>
+  <g fill="#8fa7ff">
+    <rect x="20" y="4" width="4" height="8" rx="2"/>
+    <rect x="20" y="52" width="4" height="8" rx="2"/>
+    <rect x="4" y="20" width="8" height="4" rx="2"/>
+    <rect x="52" y="20" width="8" height="4" rx="2"/>
+    <rect x="40" y="4" width="4" height="8" rx="2"/>
+    <rect x="40" y="52" width="4" height="8" rx="2"/>
+    <rect x="4" y="40" width="8" height="4" rx="2"/>
+    <rect x="52" y="40" width="8" height="4" rx="2"/>
+  </g>
+  <rect x="12" y="12" width="40" height="40" rx="8" fill="url(#vg-die)"/>
+  <rect x="12.75" y="12.75" width="38.5" height="38.5" rx="7.25" fill="none" stroke="#fff" stroke-opacity=".22" stroke-width="1.5"/>
+  <g>
+    <polygon points="32,16 22.18,32.29 32,27.83" fill="#fff"/>
+    <polygon points="32,16 41.82,32.29 32,27.83" fill="#fff" fill-opacity=".72"/>
+    <polygon points="22.18,32.29 32,38.1 32,27.83" fill="#fff" fill-opacity=".55"/>
+    <polygon points="41.82,32.29 32,38.1 32,27.83" fill="#fff" fill-opacity=".38"/>
+    <polygon points="32,39.96 22.18,34.16 32,48" fill="#fff" fill-opacity=".92"/>
+    <polygon points="32,39.96 41.82,34.16 32,48" fill="#fff" fill-opacity=".62"/>
+  </g>
+</svg>

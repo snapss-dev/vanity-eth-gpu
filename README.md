@@ -76,6 +76,9 @@ npm run test:gpu
 npm run test:gpu -- --adapter-luid=0,1234   # choose a GPU on Windows (see chrome://gpu)
 npm run test:gpu -- --swiftshader           # CPU-emulated WebGPU, no GPU needed
 
+# Regenerate icons + social cards from src/assets/*.svg (needs Google Chrome)
+npm run images
+
 # Build for production
 npm run build
 
