@@ -106,10 +106,11 @@ a:hover { text-decoration: underline; }
 }
 
 .title {
+  margin: 0 0 6px;
   font-size: 24px;
   font-weight: 700;
   letter-spacing: -0.02em;
-  margin-bottom: 6px;
+  line-height: 1.3;
 }
 
 .subtitle {
@@ -451,6 +452,37 @@ input:disabled {
   font-size: 14px;
   font-weight: 600;
   color: var(--text-primary);
+}
+
+/* Odds: chance that a match would have turned up by now (memoryless search) */
+.odds {
+  margin-top: 12px;
+}
+
+.odds.hidden {
+  display: none;
+}
+
+.odds-track {
+  height: 4px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+}
+
+.odds-fill {
+  width: 0;
+  height: 100%;
+  background: var(--grad-accent);
+  border-radius: inherit;
+  transition: width 0.25s linear;
+}
+
+.odds-text {
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
 }
 
 /* Result */
@@ -815,8 +847,17 @@ input:disabled {
     grid-template-columns: 1fr;
   }
 
+  /* Keep the three short stats on one row so the result stays near the fold. */
   .stats {
-    grid-template-columns: 1fr;
+    gap: 6px;
+  }
+
+  .stat {
+    padding: 10px 4px;
+  }
+
+  .stat-value {
+    font-size: 13px;
   }
 
   .options {

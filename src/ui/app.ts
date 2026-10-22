@@ -1,54 +1,25 @@
-import { bytesToHex, nowMs } from '../utils/hex'
-import { createKeystoreV3, type KeystoreV3 } from '../wallet/keystoreV3'
+import { bytesToHex } from '../utils/hex'
+import { createKeystoreV3 } from '../wallet/keystoreV3'
 import { type PrivKey32 } from '../wallet/keys'
-import { createWorkerPool } from '../worker/pool'
-import { createWasmWorkerPool, type WasmWorkerPool } from '../worker/wasmPool'
-import { createGpuVanityPool } from '../webgpu/gpuVanity'
-import { type SearchTarget, searchTargetToGpuMode } from '../searchTarget'
-import { verifyFoundResult } from '../vanityResult'
+import { type SearchTarget } from '../searchTarget'
 import { ADDRESS_NIBBLE_LENGTH, calculatePatternDifficulty, mergeAddressPattern } from '../searchPattern'
+import { createSearchController, type Engine, type SearchRequest } from '../search/controller'
+import { chanceFoundByNow, formatDuration, formatNumber, secondsForChance } from './format'
 
-// Benchmark cache: once determined, reuse the winner for the session
-let cachedBackend: 'gpu' | 'wasm' | 'cpu' | null = null
+const DONATE_ADDRESS = '0x99999933F17A1339958d50b3f59740E5Ad48C74C'
+const DEFAULT_SUBTITLE = 'Fast vanity address generator'
 
-type RunState =
-  | { status: 'idle' }
-  | { status: 'running'; startedAtMs: number; generated: number; speed: number }
-  | { status: 'found'; generated: number; time: number; foundPriv: PrivKey32; foundAddress: string }
+type Found = {
+  priv: PrivKey32
+  targetAddress: string
+  walletAddress: string
+  target: SearchTarget
+  /** Revealed, copied or downloaded: the user has had a chance to keep it. */
+  exported: boolean
+}
 
 function sanitizeHex(s: string): string {
-  return s.trim().replace(/^0x/i, '').replace(/[^0-9a-fA-F]/g, '').slice(0, 40)
-}
-
-function formatNumber(n: number): string {
-  if (n >= 1e12) return (n / 1e12).toFixed(1) + 'T'
-  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B'
-  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M'
-  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K'
-  return n.toLocaleString()
-}
-
-function formatTime(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(1)}h`
-  if (seconds < 31536000) return `${(seconds / 86400).toFixed(1)}d`
-  return `${(seconds / 31536000).toFixed(1)}y`
-}
-
-function estimateTime(difficulty: number, speed: number): string {
-  if (!Number.isFinite(difficulty)) return 'Impossible'
-  if (speed === 0) return '-'
-  // The search is memoryless, so report the MEDIAN time (50% chance of a hit by
-  // then) rather than a mean that reads like a deadline. Median attempts = D·ln2.
-  const seconds = (difficulty * Math.LN2) / speed
-  return '~' + formatTime(seconds) + ' (50%)'
-}
-
-// Probability that at least one match has been found after `generated` attempts.
-function chanceFoundByNow(difficulty: number, generated: number): number {
-  if (difficulty <= 0) return 1
-  return 1 - Math.exp(-generated / difficulty)
+  return s.trim().replace(/^0x/i, '').replace(/[^0-9a-fA-F]/g, '').slice(0, ADDRESS_NIBBLE_LENGTH)
 }
 
 function targetPreviewLabel(target: SearchTarget): string {
@@ -57,6 +28,12 @@ function targetPreviewLabel(target: SearchTarget): string {
 
 function targetResultLabel(target: SearchTarget): string {
   return target === 'first-contract' ? 'First Contract Address' : 'Wallet Address'
+}
+
+function engineText(engine: Engine): string {
+  return engine.kind === 'gpu'
+    ? `Running on ${engine.labels.length > 1 ? `${engine.labels.length} GPUs` : 'GPU'} · ${engine.labels.join(' + ')}`
+    : `Running on CPU · ${engine.threads} thread${engine.threads === 1 ? '' : 's'}`
 }
 
 async function copyToClipboard(text: string, btn: HTMLButtonElement) {
@@ -102,11 +79,11 @@ export function initApp(root: HTMLDivElement) {
           </g>
         </svg>
       </div>
-      <div class="title">Vanity ETH GPU</div>
-      <div class="subtitle" id="subtitle" aria-live="polite">Fast vanity address generator</div>
+      <h1 class="title">Vanity ETH GPU</h1>
+      <div class="subtitle" id="subtitle" aria-live="polite">${DEFAULT_SUBTITLE}</div>
     </div>
 
-    <div class="panel">
+    <main class="panel">
       <div class="preview" id="preview">
         <div class="preview-label" id="preview-label">Wallet Address Preview</div>
         <div class="preview-address" id="preview-addr"></div>
@@ -115,18 +92,18 @@ export function initApp(root: HTMLDivElement) {
       <div class="input-group">
         <div class="field">
           <label for="prefix">Prefix</label>
-          <input type="text" id="prefix" placeholder="c0ffee" spellcheck="false" autocomplete="off" maxlength="40" inputmode="text" pattern="[0-9a-fA-F]*">
+          <input type="text" id="prefix" placeholder="c0ffee" spellcheck="false" autocomplete="off" autocapitalize="off" maxlength="40" pattern="[0-9a-fA-F]*">
         </div>
         <div class="field">
           <label for="suffix">Suffix</label>
-          <input type="text" id="suffix" placeholder="beef" spellcheck="false" autocomplete="off" maxlength="40" inputmode="text" pattern="[0-9a-fA-F]*">
+          <input type="text" id="suffix" placeholder="beef" spellcheck="false" autocomplete="off" autocapitalize="off" maxlength="40" pattern="[0-9a-fA-F]*">
         </div>
       </div>
 
       <div class="options">
         <div class="target-wrap">
-          <div class="target-label">Target</div>
-          <div class="target-toggle" role="radiogroup" aria-label="Search target">
+          <div class="target-label" id="target-label">Target</div>
+          <div class="target-toggle" role="radiogroup" aria-labelledby="target-label">
             <label class="target-option">
               <input type="radio" name="search-target" value="wallet" checked>
               <span>Wallet</span>
@@ -149,7 +126,7 @@ export function initApp(root: HTMLDivElement) {
       </div>
 
       <div class="helper-text" id="target-help">Wallet mode searches for an address controlled directly by the generated private key.</div>
-      <div class="pattern-warning hidden" id="pattern-warning"></div>
+      <div class="pattern-warning hidden" id="pattern-warning" role="status"></div>
 
       <button class="btn-generate" id="btn-generate">Generate</button>
 
@@ -163,9 +140,16 @@ export function initApp(root: HTMLDivElement) {
           <div class="stat-value" id="stat-checked">0</div>
         </div>
         <div class="stat">
-          <div class="stat-label">Est. Time</div>
+          <div class="stat-label" id="stat-eta-label">Difficulty</div>
           <div class="stat-value" id="stat-eta">-</div>
         </div>
+      </div>
+
+      <div class="odds hidden" id="odds">
+        <div class="odds-track" role="progressbar" aria-label="Chance a match has turned up" aria-valuemin="0" aria-valuemax="100" id="odds-track">
+          <div class="odds-fill" id="odds-fill"></div>
+        </div>
+        <div class="odds-text" id="odds-text"></div>
       </div>
 
       <div class="result" id="result">
@@ -205,21 +189,21 @@ export function initApp(root: HTMLDivElement) {
           </ul>
         </div>
       </div>
-    </div>
+    </main>
 
-    <div class="footer">
+    <footer class="footer">
       <div>All computations run locally in your browser. For maximum security, disconnect from the internet before generating.</div>
       <div class="built-by">Built by <a href="https://x.com/snapss" target="_blank" rel="noopener">@snapss</a> & <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a></div>
       <div class="open-source"><a href="https://github.com/HODL-Community/vanity-eth-gpu" target="_blank" rel="noopener">Open Source</a> on GitHub</div>
-      <div class="donate">Donate: <span class="donate-addr">0x99999933F17A1339958d50b3f59740E5Ad48C74C</span><button class="copy-btn-small" id="copy-donate">Copy</button></div>
-    </div>
+      <div class="donate">Donate: <span class="donate-addr">${DONATE_ADDRESS}</span><button class="copy-btn-small" id="copy-donate">Copy</button></div>
+    </footer>
 
     <div class="modal-overlay" id="pw-modal" hidden>
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pw-modal-title">
         <div class="modal-title" id="pw-modal-title">Encrypt Keystore</div>
         <div class="modal-desc">Choose a password to encrypt your private key. You'll need this exact password to import the keystore — there is no recovery if you lose it.</div>
-        <input type="password" id="pw-input" class="modal-input" placeholder="Password (min 8 characters)" autocomplete="new-password" spellcheck="false">
-        <input type="password" id="pw-confirm" class="modal-input" placeholder="Confirm password" autocomplete="new-password" spellcheck="false">
+        <input type="password" id="pw-input" class="modal-input" placeholder="Password (min 8 characters)" autocomplete="new-password" spellcheck="false" aria-label="Password">
+        <input type="password" id="pw-confirm" class="modal-input" placeholder="Confirm password" autocomplete="new-password" spellcheck="false" aria-label="Confirm password">
         <div class="modal-error" id="pw-error" aria-live="polite"></div>
         <div class="modal-actions">
           <button class="btn" id="pw-cancel">Cancel</button>
@@ -229,93 +213,92 @@ export function initApp(root: HTMLDivElement) {
     </div>
   `
 
-  // Elements
-  const prefixInput = root.querySelector<HTMLInputElement>('#prefix')!
-  const suffixInput = root.querySelector<HTMLInputElement>('#suffix')!
+  const $ = <T extends HTMLElement>(id: string) => root.querySelector<T>('#' + id)!
+
+  const prefixInput = $<HTMLInputElement>('prefix')
+  const suffixInput = $<HTMLInputElement>('suffix')
   const searchTargetInputs = Array.from(root.querySelectorAll<HTMLInputElement>('input[name="search-target"]'))
-  const caseSensitive = root.querySelector<HTMLInputElement>('#case-sensitive')!
-  const previewEl = root.querySelector<HTMLDivElement>('#preview')!
-  const previewLabel = root.querySelector<HTMLDivElement>('#preview-label')!
-  const previewAddr = root.querySelector<HTMLDivElement>('#preview-addr')!
-  const btnGenerate = root.querySelector<HTMLButtonElement>('#btn-generate')!
-  const statSpeed = root.querySelector<HTMLDivElement>('#stat-speed')!
-  const statChecked = root.querySelector<HTMLDivElement>('#stat-checked')!
-  const statEta = root.querySelector<HTMLDivElement>('#stat-eta')!
-  const resultEl = root.querySelector<HTMLDivElement>('#result')!
-  const resultAddrLabel = root.querySelector<HTMLDivElement>('#result-addr-label')!
-  const addrText = root.querySelector<HTMLSpanElement>('#addr-text')!
-  const walletRow = root.querySelector<HTMLDivElement>('#wallet-row')!
-  const walletText = root.querySelector<HTMLSpanElement>('#wallet-text')!
-  const pkText = root.querySelector<HTMLSpanElement>('#pk-text')!
-  const copyAddr = root.querySelector<HTMLButtonElement>('#copy-addr')!
-  const copyWallet = root.querySelector<HTMLButtonElement>('#copy-wallet')!
-  const copyPk = root.querySelector<HTMLButtonElement>('#copy-pk')!
-  const btnReveal = root.querySelector<HTMLButtonElement>('#btn-reveal')!
-  const btnDownload = root.querySelector<HTMLButtonElement>('#btn-download')!
-  const subtitleEl = root.querySelector<HTMLDivElement>('#subtitle')!
-  const targetHelp = root.querySelector<HTMLDivElement>('#target-help')!
-  const patternWarning = root.querySelector<HTMLDivElement>('#pattern-warning')!
-  const verificationProof = root.querySelector<HTMLDivElement>('#verification-proof')!
+  const caseSensitive = $<HTMLInputElement>('case-sensitive')
+  const previewEl = $<HTMLDivElement>('preview')
+  const previewLabel = $<HTMLDivElement>('preview-label')
+  const previewAddr = $<HTMLDivElement>('preview-addr')
+  const btnGenerate = $<HTMLButtonElement>('btn-generate')
+  const statSpeed = $<HTMLDivElement>('stat-speed')
+  const statChecked = $<HTMLDivElement>('stat-checked')
+  const statEtaLabel = $<HTMLDivElement>('stat-eta-label')
+  const statEta = $<HTMLDivElement>('stat-eta')
+  const odds = $<HTMLDivElement>('odds')
+  const oddsTrack = $<HTMLDivElement>('odds-track')
+  const oddsFill = $<HTMLDivElement>('odds-fill')
+  const oddsText = $<HTMLDivElement>('odds-text')
+  const resultEl = $<HTMLDivElement>('result')
+  const resultAddrLabel = $<HTMLDivElement>('result-addr-label')
+  const addrText = $<HTMLSpanElement>('addr-text')
+  const walletRow = $<HTMLDivElement>('wallet-row')
+  const walletText = $<HTMLSpanElement>('wallet-text')
+  const pkText = $<HTMLSpanElement>('pk-text')
+  const pkWarning = $<HTMLDivElement>('pk-warning')
+  const copyAddr = $<HTMLButtonElement>('copy-addr')
+  const copyWallet = $<HTMLButtonElement>('copy-wallet')
+  const copyPk = $<HTMLButtonElement>('copy-pk')
+  const btnReveal = $<HTMLButtonElement>('btn-reveal')
+  const btnDownload = $<HTMLButtonElement>('btn-download')
+  const subtitleEl = $<HTMLDivElement>('subtitle')
+  const targetHelp = $<HTMLDivElement>('target-help')
+  const patternWarning = $<HTMLDivElement>('pattern-warning')
+  const verificationProof = $<HTMLDivElement>('verification-proof')
 
-  // State
-  let runState: RunState = { status: 'idle' }
-  let stopRequested = false
-  let lastFound: { priv: PrivKey32; targetAddress: string; walletAddress: string; target: SearchTarget } | null = null
+  const controller = createSearchController()
 
-  // Cleanup for whatever backend pool is currently active, so an exception
-  // mid-search (e.g. a lost GPU device) can release it instead of leaking.
-  let activePoolCleanup: (() => void) | null = null
-  function runActivePoolCleanup() {
-    if (activePoolCleanup) {
-      try { activePoolCleanup() } catch { /* ignore */ }
-      activePoolCleanup = null
-    }
-  }
-  // Return the UI to the idle state. Never clobbers a displayed 'found' result.
-  function forceIdle() {
-    runActivePoolCleanup()
-    if (runState.status === 'found') return
-    prefixInput.disabled = false
-    suffixInput.disabled = false
-    for (const input of searchTargetInputs) input.disabled = false
-    caseSensitive.disabled = false
-    btnGenerate.textContent = 'Generate'
-    btnGenerate.classList.remove('running')
-    previewEl.classList.remove('generating')
-    runState = { status: 'idle' }
-  }
+  let found: Found | null = null
+  let keyRevealed = false
 
-  // Deterministic noise based on position (looks random but stable)
-  const noiseChars = '7a3f8c2e9b1d5046'
-  function generateNoise(len: number, offset: number): string {
-    let result = ''
-    for (let i = 0; i < len; i++) {
-      result += noiseChars[(i + offset * 7) % noiseChars.length]
-    }
-    return result
-  }
+  // Live stats while running. Speed is measured over a sliding ~2 s window.
+  let run: { request: SearchRequest; difficulty: number; checked: number; samples: Array<[number, number]> } | null = null
+  let lastSpeed = 0
+
+  // ── Helpers ──
 
   function selectedTarget(): SearchTarget {
     const checked = searchTargetInputs.find(input => input.checked)
     return checked?.value === 'first-contract' ? 'first-contract' : 'wallet'
   }
 
-  function updateTargetLabels() {
-    const target = selectedTarget()
-    previewLabel.textContent = targetPreviewLabel(target)
-    targetHelp.textContent = target === 'first-contract'
-      ? 'First-contract mode targets the first CREATE address at nonce 0. Use the deployer before any other outgoing transaction.'
-      : 'Wallet mode searches for an address controlled directly by the generated private key.'
+  function currentRequest(): SearchRequest {
+    return {
+      prefix: sanitizeHex(prefixInput.value),
+      suffix: sanitizeHex(suffixInput.value),
+      caseSensitive: caseSensitive.checked,
+      target: selectedTarget(),
+    }
+  }
+
+  function setInputsDisabled(disabled: boolean) {
+    prefixInput.disabled = disabled
+    suffixInput.disabled = disabled
+    for (const input of searchTargetInputs) input.disabled = disabled
+    caseSensitive.disabled = disabled
+  }
+
+  function showWarning(text: string | null) {
+    patternWarning.textContent = text ?? ''
+    patternWarning.classList.toggle('hidden', !text)
+  }
+
+  // Deterministic noise based on position (looks random but stable)
+  const noiseChars = '7a3f8c2e9b1d5046'
+  function generateNoise(len: number, offset: number): string {
+    let result = ''
+    for (let i = 0; i < len; i++) result += noiseChars[(i + offset * 7) % noiseChars.length]
+    return result
   }
 
   function renderPreviewAddress(pattern: ReturnType<typeof mergeAddressPattern>) {
     previewAddr.replaceChildren(document.createTextNode('0x'))
-
     if (pattern.constrainedNibbles === 0 || !pattern.valid) {
       previewAddr.append(document.createTextNode(generateNoise(ADDRESS_NIBBLE_LENGTH, 0)))
       return
     }
-
     let noiseOffset = 0
     for (let i = 0; i < ADDRESS_NIBBLE_LENGTH; i++) {
       const known = pattern.body[i]
@@ -330,498 +313,67 @@ export function initApp(root: HTMLDivElement) {
     }
   }
 
-  // Update preview
+  /** Re-render everything derived from the inputs while idle. */
   function updatePreview() {
-    updateTargetLabels()
-    const pre = sanitizeHex(prefixInput.value)
-    const suf = sanitizeHex(suffixInput.value)
-    const pattern = mergeAddressPattern(pre, suf, caseSensitive.checked)
+    const req = currentRequest()
+    previewLabel.textContent = targetPreviewLabel(req.target)
+    targetHelp.textContent = req.target === 'first-contract'
+      ? 'First-contract mode targets the first CREATE address at nonce 0. Use the deployer before any other outgoing transaction.'
+      : 'Wallet mode searches for an address controlled directly by the generated private key.'
 
+    const pattern = mergeAddressPattern(req.prefix, req.suffix, req.caseSensitive)
     renderPreviewAddress(pattern)
+    const empty = req.prefix.length + req.suffix.length === 0
 
+    if (!pattern.valid) showWarning(pattern.message || 'This prefix/suffix request is impossible.')
+    else if (empty) showWarning('Enter a hex prefix or suffix to start.')
+    else showWarning(null)
+
+    if (run) return // the running search owns the button and stats
+    btnGenerate.disabled = !pattern.valid || empty
+
+    const difficulty = calculatePatternDifficulty(req.prefix, req.suffix, req.caseSensitive)
+    statEtaLabel.textContent = 'Difficulty'
+    statEta.title = ''
     if (!pattern.valid) {
-      patternWarning.textContent = pattern.message || 'This prefix/suffix request is impossible.'
-      patternWarning.classList.remove('hidden')
-    } else if (pre.length + suf.length === 0) {
-      patternWarning.textContent = 'Enter a hex prefix or suffix to start.'
-      patternWarning.classList.remove('hidden')
-    } else {
-      patternWarning.textContent = ''
-      patternWarning.classList.add('hidden')
-    }
-
-    btnGenerate.disabled = runState.status !== 'running' && (!pattern.valid || pre.length + suf.length === 0)
-
-    // Update ETA based on difficulty
-    const difficulty = calculatePatternDifficulty(pre, suf, caseSensitive.checked)
-    if (runState.status === 'running' && runState.speed > 0) {
-      statEta.textContent = estimateTime(difficulty, runState.speed)
-    } else if (!pattern.valid) {
       statEta.textContent = 'Impossible'
-    } else if (pre.length + suf.length > 0) {
-      statEta.textContent = `1 in ${formatNumber(difficulty)}`
-    } else {
+    } else if (empty) {
       statEta.textContent = '-'
-    }
-  }
-
-  // Update stats display
-  function updateStats() {
-    if (runState.status === 'running') {
-      statSpeed.textContent = formatNumber(runState.speed) + '/s'
-      statChecked.textContent = formatNumber(runState.generated)
-      const pre = sanitizeHex(prefixInput.value)
-      const suf = sanitizeHex(suffixInput.value)
-      const difficulty = calculatePatternDifficulty(pre, suf, caseSensitive.checked)
-      statEta.textContent = estimateTime(difficulty, runState.speed)
-      // Surface the live "probability of a hit by now" so a long-but-normal run
-      // doesn't feel broken — it's a memoryless process, not a countdown.
-      const pct = Math.round(chanceFoundByNow(difficulty, runState.generated) * 100)
-      statEta.title = `${pct}% chance of a match by now (median ETA shown)`
-    } else if (runState.status === 'found') {
-      statEta.title = ''
-      statChecked.textContent = formatNumber(runState.generated)
-      statEta.textContent = `Found in ${formatTime(runState.time)}`
-    }
-  }
-
-  // Convert hex string to nibble array (each hex char → number 0-15)
-  function hexToNibbles(hex: string): number[] {
-    return hex.split('').map(c => parseInt(c, 16))
-  }
-
-  // Main generation loop - auto-benchmarks GPU vs CPU on first run
-  async function run() {
-    stopRequested = false
-    btnGenerate.textContent = 'Stop'
-    btnGenerate.classList.add('running')
-    previewEl.classList.add('generating')
-    resultEl.classList.remove('visible', 'found')
-    walletRow.classList.add('hidden')
-    walletText.textContent = ''
-    maskKey()
-    lastFound = null
-
-    // Disable inputs while running
-    prefixInput.disabled = true
-    suffixInput.disabled = true
-    for (const input of searchTargetInputs) input.disabled = true
-    caseSensitive.disabled = true
-
-    const pre = sanitizeHex(prefixInput.value)
-    const suf = sanitizeHex(suffixInput.value)
-    const preLower = pre.toLowerCase()
-    const sufLower = suf.toLowerCase()
-    const target = selectedTarget()
-    const pattern = mergeAddressPattern(pre, suf, caseSensitive.checked)
-
-    if (!pattern.valid || pre.length + suf.length === 0) {
-      resetUI()
-      updatePreview()
-      return
-    }
-
-    // Helper to reset UI on early exit during benchmark
-    function resetUI() {
-      prefixInput.disabled = false
-      suffixInput.disabled = false
-      for (const input of searchTargetInputs) input.disabled = false
-      caseSensitive.disabled = false
-      btnGenerate.textContent = 'Generate'
-      btnGenerate.classList.remove('running')
-      previewEl.classList.remove('generating')
-      subtitleEl.textContent = 'Fast vanity address generator'
-      runState = { status: 'idle' }
-    }
-
-    // ── Auto-benchmark on first run (GPU vs WASM vs CPU) ──
-    if (cachedBackend === null) {
-      const BENCH_DURATION_MS = 3000
-      const BENCH_BATCH = 16384
-
-      // Check if GPU is available at all
-      let gpuAvailable = false
-      let gpuCount = 0
-      try {
-        const testPool = await createGpuVanityPool()
-        gpuCount = testPool.instances.length
-        testPool.destroy()
-        gpuAvailable = true
-      } catch {
-        // WebGPU not available
-      }
-
-      if (stopRequested) { resetUI(); return }
-
-      let gpuSpeed = 0
-      let wasmSpeed = 0
-      let cpuSpeed = 0
-      let wasmPool: WasmWorkerPool | null = null
-
-      if (gpuAvailable) {
-        // Benchmark all GPUs together (running in parallel) for a fair
-        // comparison against the multi-worker WASM/CPU pools.
-        subtitleEl.textContent = gpuCount > 1 ? `Benchmarking ${gpuCount} GPUs...` : 'Benchmarking GPU...'
-        const dummyNibbles = [0, 0, 0, 0, 0, 0, 0, 0]
-        const mode = searchTargetToGpuMode(target)
-        let gpuChecked = 0
-        const gpuPool = await createGpuVanityPool()
-        gpuCount = gpuPool.instances.length
-        const gpuStart = nowMs()
-        while (nowMs() - gpuStart < BENCH_DURATION_MS && !stopRequested) {
-          await Promise.all(gpuPool.instances.map(g =>
-            g.search(dummyNibbles, dummyNibbles, BENCH_BATCH, mode)
-          ))
-          gpuChecked += BENCH_BATCH * gpuPool.instances.length
-        }
-        gpuSpeed = gpuChecked / ((nowMs() - gpuStart) / 1000)
-        gpuPool.destroy()
-
-        if (stopRequested) { resetUI(); return }
-      }
-
-      // Benchmark WASM (sequential init with timeout, won't hang)
-      subtitleEl.textContent = 'Benchmarking WASM...'
-      wasmPool = await createWasmWorkerPool(10000)
-
-      if (wasmPool && !stopRequested) {
-        let wasmChecked = 0
-        const wasmStart = nowMs()
-        while (nowMs() - wasmStart < BENCH_DURATION_MS && !stopRequested) {
-          const promises = []
-          for (let i = 0; i < wasmPool.workerCount; i++) {
-            promises.push(wasmPool.search('00000000', '', BENCH_BATCH, target))
-          }
-          const results = await Promise.all(promises)
-          for (const r of results) wasmChecked += r.checked
-        }
-        wasmSpeed = wasmChecked / ((nowMs() - wasmStart) / 1000)
-        // Don't destroy yet — we might use it for the real search
-      }
-
-      if (stopRequested) {
-        wasmPool?.destroy()
-        resetUI()
-        return
-      }
-
-      // Benchmark CPU
-      subtitleEl.textContent = 'Benchmarking CPU...'
-      let cpuChecked = 0
-      const benchPool = createWorkerPool()
-      const cpuStart = nowMs()
-      while (nowMs() - cpuStart < BENCH_DURATION_MS && !stopRequested) {
-        const promises = []
-        for (let i = 0; i < benchPool.workerCount; i++) {
-          promises.push(benchPool.search('00000000', '', BENCH_BATCH, target))
-        }
-        const results = await Promise.all(promises)
-        for (const r of results) cpuChecked += r.checked
-      }
-      cpuSpeed = cpuChecked / ((nowMs() - cpuStart) / 1000)
-      benchPool.destroy()
-
-      if (stopRequested) {
-        wasmPool?.destroy()
-        resetUI()
-        return
-      }
-
-      // Pick the winner
-      const speeds: [string, number][] = []
-      if (gpuAvailable) speeds.push(['gpu', gpuSpeed])
-      if (wasmPool) speeds.push(['wasm', wasmSpeed])
-      speeds.push(['cpu', cpuSpeed])
-      speeds.sort((a, b) => b[1] - a[1])
-      const winner = speeds[0][0] as 'gpu' | 'wasm' | 'cpu'
-      cachedBackend = winner
-
-      // Destroy WASM pool if it lost
-      if (winner !== 'wasm') wasmPool?.destroy()
-
-      // Show result for 2 seconds
-      const parts: string[] = []
-      if (gpuAvailable) parts.push(`GPU${gpuCount > 1 ? ` x${gpuCount}` : ''}: ${formatNumber(Math.round(gpuSpeed))}/s`)
-      if (wasmPool) parts.push(`WASM: ${formatNumber(Math.round(wasmSpeed))}/s`)
-      parts.push(`CPU: ${formatNumber(Math.round(cpuSpeed))}/s`)
-      subtitleEl.textContent = `${parts.join(' | ')} → Using ${winner.toUpperCase()}`
-      await new Promise(resolve => setTimeout(resolve, 2000))
-
-      if (stopRequested) {
-        if (winner === 'wasm') wasmPool?.destroy()
-        resetUI()
-        return
-      }
-    }
-
-    // ── Start the real search ──
-    const startedAtMs = nowMs()
-    runState = { status: 'running', startedAtMs, generated: 0, speed: 0 }
-
-    let recentGenerated = 0
-    let recentStartMs = nowMs()
-
-    if (cachedBackend === 'gpu') {
-      // ── GPU path (one concurrent loop per physical GPU) ──
-      const gpuPool = await createGpuVanityPool()
-      activePoolCleanup = () => gpuPool.destroy()
-      const gpuCount = gpuPool.instances.length
-      subtitleEl.textContent = gpuCount > 1
-        ? `Running on ${gpuCount} GPUs (${gpuPool.labels.join(', ')})`
-        : `Running on GPU (${gpuPool.labels[0]})`
-      const prefixNibbles = hexToNibbles(preLower)
-      const suffixNibbles = hexToNibbles(sufLower)
-      const gpuBatchSize = 16384
-      const mode = searchTargetToGpuMode(target)
-
-      // A single timer aggregates throughput; each GPU loop only bumps counters.
-      let gpuInvalid = false
-      const speedTimer = setInterval(() => {
-        const elapsed = nowMs() - recentStartMs
-        if (elapsed >= 500 && runState.status === 'running') {
-          const speed = Math.floor(recentGenerated / (elapsed / 1000))
-          runState = { ...runState, speed }
-          recentGenerated = 0
-          recentStartMs = nowMs()
-          updateStats()
-        }
-      }, 250)
-
-      try {
-        // Each GPU runs its own search loop concurrently. They draw independent
-        // random seeds, so no coordination is needed, and a match on any GPU
-        // sets stopRequested, draining all loops.
-        await Promise.all(gpuPool.instances.map(async (gpu) => {
-          while (!stopRequested && !gpuInvalid) {
-            const result = await gpu.search(prefixNibbles, suffixNibbles, gpuBatchSize, mode)
-
-            if (result && runState.status === 'running') {
-              const accepted = handleFound(result.privHex, result.addressHex, pre, suf, target)
-              if (!accepted && runState.status === 'running') {
-                // GPU produced an address its key doesn't control — drain all loops
-                // and fall back to CPU (verifyFoundResult is the safety net).
-                gpuInvalid = true
-                cachedBackend = 'cpu'
-                subtitleEl.textContent = 'GPU result failed validation, falling back to CPU...'
-                break
-              }
-            }
-
-            if (runState.status === 'running') {
-              runState = { ...runState, generated: runState.generated + gpuBatchSize }
-            }
-            recentGenerated += gpuBatchSize
-          }
-        }))
-      } finally {
-        clearInterval(speedTimer)
-        gpuPool.destroy()
-        activePoolCleanup = null
-      }
-    } else if (cachedBackend === 'wasm') {
-      // ── WASM path (pool already initialized from benchmark) ──
-      const pool = await createWasmWorkerPool(10000)
-      if (!pool) {
-        // Fallback to CPU if WASM init fails on second attempt
-        cachedBackend = 'cpu'
-        subtitleEl.textContent = 'WASM failed, falling back to CPU...'
-        await new Promise(resolve => setTimeout(resolve, 1000))
-      }
-
-      if (pool && cachedBackend === 'wasm') {
-        activePoolCleanup = () => pool.destroy()
-        subtitleEl.textContent = `Running on WASM (${pool.workerCount} workers)`
-        const batchPerWorker = 16384
-
-        try {
-          while (!stopRequested) {
-            const promises = []
-            for (let i = 0; i < pool.workerCount; i++) {
-              promises.push(pool.search(preLower, sufLower, batchPerWorker, target))
-            }
-
-            const results = await Promise.all(promises)
-            let totalChecked = 0
-
-            for (const r of results) {
-              totalChecked += r.checked
-              if (r.found && runState.status === 'running') {
-                handleFound(r.found.privHex, r.found.address, pre, suf, target)
-              }
-            }
-
-            if (runState.status === 'running') {
-              runState = { ...runState, generated: runState.generated + totalChecked }
-            }
-            recentGenerated += totalChecked
-
-            const elapsed = nowMs() - recentStartMs
-            if (elapsed >= 500 && runState.status === 'running') {
-              const speed = Math.floor(recentGenerated / (elapsed / 1000))
-              runState = { ...runState, speed }
-              recentGenerated = 0
-              recentStartMs = nowMs()
-              updateStats()
-            }
-          }
-        } finally {
-          pool.destroy()
-          activePoolCleanup = null
-        }
-      }
-    }
-
-    // CPU fallback (also handles WASM→CPU fallback)
-    if (cachedBackend === 'cpu' && !stopRequested && runState.status === 'running') {
-      // ── CPU path ──
-      const pool = createWorkerPool()
-      activePoolCleanup = () => pool.destroy()
-      subtitleEl.textContent = `Running on CPU (${pool.workerCount} workers)`
-      const batchPerWorker = 16384
-
-      try {
-        while (!stopRequested) {
-          const promises = []
-          for (let i = 0; i < pool.workerCount; i++) {
-            promises.push(pool.search(preLower, sufLower, batchPerWorker, target))
-          }
-
-          const results = await Promise.all(promises)
-          let totalChecked = 0
-
-          for (const r of results) {
-            totalChecked += r.checked
-            if (r.found && runState.status === 'running') {
-              handleFound(r.found.privHex, r.found.address, pre, suf, target)
-            }
-          }
-
-          if (runState.status === 'running') {
-            runState = { ...runState, generated: runState.generated + totalChecked }
-          }
-          recentGenerated += totalChecked
-
-          const elapsed = nowMs() - recentStartMs
-          if (elapsed >= 500 && runState.status === 'running') {
-            const speed = Math.floor(recentGenerated / (elapsed / 1000))
-            runState = { ...runState, speed }
-            recentGenerated = 0
-            recentStartMs = nowMs()
-            updateStats()
-          }
-        }
-      } finally {
-        pool.destroy()
-        activePoolCleanup = null
-      }
-    }
-
-    // Re-enable inputs
-    prefixInput.disabled = false
-    suffixInput.disabled = false
-    for (const input of searchTargetInputs) input.disabled = false
-    caseSensitive.disabled = false
-
-    if (!stopRequested || runState.status === 'running') {
-      btnGenerate.textContent = 'Generate'
-      btnGenerate.classList.remove('running')
-      previewEl.classList.remove('generating')
-      subtitleEl.textContent = 'Fast vanity address generator'
-      runState = { status: 'idle' }
-    }
-  }
-
-  function handleFound(privHex: string, foundAddress: string, pre: string, suf: string, target: SearchTarget): boolean {
-    const verified = verifyFoundResult(privHex, foundAddress, pre, suf, target, caseSensitive.checked)
-
-    if (verified) {
-      const { priv, targetAddress: verifiedTargetAddress, walletAddress } = verified
-      const timeS = (nowMs() - (runState as any).startedAtMs) / 1000
-      const generated: number = runState.status === 'running' ? runState.generated : 0
-
-      runState = { status: 'found', generated, time: timeS, foundPriv: priv, foundAddress: verifiedTargetAddress }
-      lastFound = { priv, targetAddress: verifiedTargetAddress, walletAddress, target }
-      resultAddrLabel.textContent = targetResultLabel(target)
-      verificationProof.textContent = target === 'first-contract'
-        ? 'Verified locally: this private key derives to the deployer wallet, and its first CREATE nonce-0 contract address matches this result.'
-        : 'Verified locally: this private key derives to the displayed wallet address.'
-
-      const preMatch = verifiedTargetAddress.slice(2, 2 + pre.length)
-      const sufMatch = verifiedTargetAddress.slice(2 + 40 - suf.length)
-      const midPart = verifiedTargetAddress.slice(2 + pre.length, 2 + 40 - suf.length)
-
-      addrText.innerHTML = `0x<span class="highlight">${preMatch}</span>${midPart}<span class="highlight">${sufMatch}</span>`
-      walletText.textContent = walletAddress
-      if (target === 'first-contract') {
-        walletRow.classList.remove('hidden')
-      } else {
-        walletRow.classList.add('hidden')
-      }
-      maskKey() // private key stays hidden until the user explicitly reveals it
-
-      resultEl.classList.add('visible', 'found')
-      btnGenerate.textContent = 'Generate'
-      btnGenerate.classList.remove('running')
-      previewEl.classList.remove('generating')
-      updateStats()
-
-      stopRequested = true
-      return true
-    }
-
-    patternWarning.textContent = 'Rejected an invalid generated result before display. Retrying with a safer path.'
-    patternWarning.classList.remove('hidden')
-
-    return false
-  }
-
-  // Event listeners
-  prefixInput.addEventListener('input', () => {
-    prefixInput.value = sanitizeHex(prefixInput.value)
-    updatePreview()
-  })
-
-  suffixInput.addEventListener('input', () => {
-    suffixInput.value = sanitizeHex(suffixInput.value)
-    updatePreview()
-  })
-
-  for (const input of searchTargetInputs) {
-    input.addEventListener('change', () => {
-      updatePreview()
-    })
-  }
-
-  caseSensitive.addEventListener('change', () => {
-    updatePreview()
-  })
-
-  btnGenerate.addEventListener('click', () => {
-    if (runState.status === 'running') {
-      stopRequested = true
     } else {
-      run().catch((err) => {
-        // Any unexpected failure (lost GPU device, shader compile error, worker
-        // crash) must not strand the UI in a disabled 'running' state.
-        console.error('[vanity] search failed', err)
-        if (runState.status !== 'found') {
-          subtitleEl.textContent = 'Something went wrong during the search — please reload the page.'
-        }
-        forceIdle()
-      })
+      statEta.textContent = `1 in ${formatNumber(difficulty)}`
+      if (lastSpeed > 0) statEta.title = `About ${formatDuration(secondsForChance(difficulty, lastSpeed, 0.5))} for a 50% chance at the last measured speed`
     }
-  })
+  }
 
-  // Enter key to start/stop
-  document.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && document.activeElement?.tagName !== 'BUTTON') {
-      e.preventDefault()
-      btnGenerate.click()
-    }
-  })
+  function currentSpeed(): number {
+    if (!run || run.samples.length < 2) return 0
+    const [t0, c0] = run.samples[0]
+    const [t1, c1] = run.samples[run.samples.length - 1]
+    return t1 > t0 ? ((c1 - c0) * 1000) / (t1 - t0) : 0
+  }
 
-  const pkWarning = root.querySelector<HTMLDivElement>('#pk-warning')!
-  let keyRevealed = false
+  function updateRunningStats() {
+    if (!run) return
+    const now = performance.now()
+    run.samples.push([now, run.checked])
+    while (run.samples.length > 2 && now - run.samples[0][0] > 2000) run.samples.shift()
+    const speed = currentSpeed()
+    if (speed > 0) lastSpeed = speed
+    statSpeed.textContent = speed > 0 ? formatNumber(speed) + '/s' : '…'
+    statChecked.textContent = formatNumber(run.checked)
+    statEtaLabel.textContent = 'Est. Time'
+    statEta.textContent = speed > 0 ? '~' + formatDuration(secondsForChance(run.difficulty, speed, 0.5)) : '…'
+    statEta.title = 'Time for a 50% chance of a match. Each key is an independent draw, so this is a typical time, not a deadline.'
+
+    const pct = Math.min(100, chanceFoundByNow(run.difficulty, run.checked) * 100)
+    odds.classList.remove('hidden')
+    oddsFill.style.width = `${pct}%`
+    oddsTrack.setAttribute('aria-valuenow', String(Math.round(pct)))
+    const p90 = speed > 0 ? ` · 90% by ~${formatDuration(secondsForChance(run.difficulty, speed, 0.9))}` : ''
+    oddsText.textContent = `${pct < 1 ? '<1' : Math.round(pct)}% chance a match would have turned up by now${p90}`
+  }
+
+  // ── Found result ──
 
   function maskKey() {
     keyRevealed = false
@@ -831,11 +383,163 @@ export function initApp(root: HTMLDivElement) {
     btnReveal.textContent = 'Reveal Key'
   }
 
+  function renderAddress(address: string, prefixLen: number, suffixLen: number) {
+    const body = address.slice(2)
+    const highlight = (text: string) => {
+      const span = document.createElement('span')
+      span.className = 'highlight'
+      span.textContent = text
+      return span
+    }
+    addrText.replaceChildren(
+      '0x',
+      highlight(body.slice(0, prefixLen)),
+      body.slice(prefixLen, ADDRESS_NIBBLE_LENGTH - suffixLen),
+      highlight(body.slice(ADDRESS_NIBBLE_LENGTH - suffixLen)),
+    )
+  }
+
+  function showFound(req: SearchRequest, result: { priv: PrivKey32; targetAddress: string; walletAddress: string }) {
+    found = { ...result, target: req.target, exported: false }
+    resultAddrLabel.textContent = targetResultLabel(req.target)
+    verificationProof.textContent = req.target === 'first-contract'
+      ? 'Verified locally: this private key derives to the deployer wallet, and its first CREATE nonce-0 contract address matches this result.'
+      : 'Verified locally: this private key derives to the displayed wallet address.'
+    renderAddress(result.targetAddress, req.prefix.length, req.suffix.length)
+    walletText.textContent = result.walletAddress
+    walletRow.classList.toggle('hidden', req.target !== 'first-contract')
+    maskKey() // the private key stays hidden until the user explicitly reveals it
+    resultEl.classList.add('visible', 'found')
+    // On small screens the result lands below the fold.
+    const reduceMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches
+    resultEl.scrollIntoView({ behavior: reduceMotion ? 'auto' : 'smooth', block: 'nearest' })
+  }
+
+  function clearFound() {
+    found = null
+    maskKey()
+    resultEl.classList.remove('visible', 'found')
+    walletRow.classList.add('hidden')
+    walletText.textContent = ''
+  }
+
+  // ── Search ──
+
+  function onEngine(engine: Engine, note?: string) {
+    let text = engineText(engine)
+    if (engine.kind === 'cpu') {
+      if (controller.gpuStatus === 'preparing') text += ' · getting the GPU ready…'
+      else if (controller.gpuUnavailableReason && !note) text += ' · WebGPU unavailable'
+    }
+    subtitleEl.textContent = text
+    if (note) showWarning(note)
+  }
+
+  async function startSearch() {
+    if (run || controller.running) return
+    const req = currentRequest()
+    const pattern = mergeAddressPattern(req.prefix, req.suffix, req.caseSensitive)
+    if (!pattern.valid || req.prefix.length + req.suffix.length === 0) return
+
+    if (found && !found.exported) {
+      const ok = window.confirm(
+        `You haven't revealed, copied or downloaded the private key for ${found.targetAddress} yet.\n\n` +
+        'Start a new search and discard it? It cannot be recovered.')
+      if (!ok) return
+    }
+
+    clearFound()
+    const current = run = {
+      request: req,
+      difficulty: calculatePatternDifficulty(req.prefix, req.suffix, req.caseSensitive),
+      checked: 0,
+      samples: [] as Array<[number, number]>,
+    }
+    setInputsDisabled(true)
+    btnGenerate.textContent = 'Stop'
+    btnGenerate.classList.add('running')
+    btnGenerate.disabled = false
+    previewEl.classList.add('generating')
+    showWarning(null)
+    subtitleEl.textContent = 'Starting…'
+    updateRunningStats()
+    const ticker = setInterval(updateRunningStats, 250)
+
+    let outcome: Awaited<ReturnType<typeof controller.search>> | null = null
+    try {
+      outcome = await controller.search(req, {
+        onEngine,
+        onProgress: (checked) => { current.checked = checked },
+      })
+      current.checked = outcome.checked
+      updateRunningStats()
+      subtitleEl.textContent = DEFAULT_SUBTITLE
+    } catch (err) {
+      // Any unexpected failure must not strand the UI in a disabled 'running' state.
+      console.error('[vanity] search failed', err)
+      subtitleEl.textContent = 'Something went wrong during the search — please reload the page.'
+    } finally {
+      clearInterval(ticker)
+      run = null
+      odds.classList.add('hidden')
+      setInputsDisabled(false)
+      btnGenerate.textContent = 'Generate'
+      btnGenerate.classList.remove('running')
+      previewEl.classList.remove('generating')
+      updatePreview()
+    }
+
+    // After updatePreview(), which resets the stats to the idle view.
+    if (outcome?.status === 'found') {
+      showFound(req, outcome.result)
+      statEtaLabel.textContent = 'Found In'
+      statEta.textContent = formatDuration(outcome.seconds)
+      statEta.title = ''
+      statChecked.textContent = formatNumber(outcome.checked)
+    }
+  }
+
+  // Start building the GPU kernel as soon as the user shows intent, so it is
+  // usually ready by the time they press Generate.
+  let warmed = false
+  function warmUp() {
+    if (warmed) return
+    warmed = true
+    void controller.prepareGpu()
+  }
+
+  // ── Events ──
+
+  for (const input of [prefixInput, suffixInput]) {
+    input.addEventListener('input', () => {
+      const clean = sanitizeHex(input.value)
+      if (clean !== input.value) input.value = clean
+      updatePreview()
+    })
+    input.addEventListener('focus', warmUp)
+    input.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault()
+        void startSearch()
+      }
+    })
+  }
+  btnGenerate.addEventListener('pointerenter', warmUp)
+
+  for (const input of searchTargetInputs) input.addEventListener('change', updatePreview)
+  caseSensitive.addEventListener('change', updatePreview)
+
+  btnGenerate.addEventListener('click', () => {
+    if (run) controller.stop()
+    else void startSearch()
+  })
+
   btnReveal.addEventListener('click', () => {
-    if (!lastFound) return
+    if (!found) return
     if (keyRevealed) { maskKey(); return }
     keyRevealed = true
-    pkText.textContent = bytesToHex(lastFound.priv)
+    found.exported = true
+    pkText.textContent = bytesToHex(found.priv)
     copyPk.classList.remove('hidden')
     pkWarning.classList.remove('hidden')
     btnReveal.textContent = 'Hide Key'
@@ -846,31 +550,38 @@ export function initApp(root: HTMLDivElement) {
   window.addEventListener('blur', () => { if (keyRevealed) maskKey() })
   document.addEventListener('visibilitychange', () => { if (document.hidden && keyRevealed) maskKey() })
 
+  // A found key exists only in this tab: warn before it's closed unsaved.
+  window.addEventListener('beforeunload', (e) => {
+    if (found && !found.exported) {
+      e.preventDefault()
+      e.returnValue = '' // older Safari / Chrome < 119 only prompt when this is set
+    }
+  })
+
   copyAddr.addEventListener('click', () => {
-    if (lastFound) void copyToClipboard(lastFound.targetAddress, copyAddr)
+    if (found) void copyToClipboard(found.targetAddress, copyAddr)
   })
 
   copyWallet.addEventListener('click', () => {
-    if (lastFound) void copyToClipboard(lastFound.walletAddress, copyWallet)
+    if (found) void copyToClipboard(found.walletAddress, copyWallet)
   })
 
   copyPk.addEventListener('click', () => {
-    if (lastFound && pkText.textContent && !pkText.textContent.includes('\u2022')) {
-      void copyToClipboard(pkText.textContent, copyPk)
-    }
+    if (found && keyRevealed) void copyToClipboard(bytesToHex(found.priv), copyPk)
   })
 
   // Password modal — replaces a bare prompt() so a typo can't silently produce an
   // undecryptable keystore (which would be permanent fund loss).
-  const pwModal = root.querySelector<HTMLDivElement>('#pw-modal')!
-  const pwInput = root.querySelector<HTMLInputElement>('#pw-input')!
-  const pwConfirm = root.querySelector<HTMLInputElement>('#pw-confirm')!
-  const pwError = root.querySelector<HTMLDivElement>('#pw-error')!
-  const pwOk = root.querySelector<HTMLButtonElement>('#pw-ok')!
-  const pwCancel = root.querySelector<HTMLButtonElement>('#pw-cancel')!
+  const pwModal = $<HTMLDivElement>('pw-modal')
+  const pwInput = $<HTMLInputElement>('pw-input')
+  const pwConfirm = $<HTMLInputElement>('pw-confirm')
+  const pwError = $<HTMLDivElement>('pw-error')
+  const pwOk = $<HTMLButtonElement>('pw-ok')
+  const pwCancel = $<HTMLButtonElement>('pw-cancel')
 
   function promptPassword(): Promise<string | null> {
     return new Promise((resolve) => {
+      const opener = document.activeElement as HTMLElement | null
       pwInput.value = ''
       pwConfirm.value = ''
       pwError.textContent = ''
@@ -879,10 +590,13 @@ export function initApp(root: HTMLDivElement) {
 
       const cleanup = () => {
         pwModal.hidden = true
+        pwInput.value = ''
+        pwConfirm.value = ''
         pwOk.removeEventListener('click', onOk)
         pwCancel.removeEventListener('click', onCancel)
         pwModal.removeEventListener('keydown', onKey)
         pwModal.removeEventListener('mousedown', onBackdrop)
+        opener?.focus()
       }
       const onOk = () => {
         const p = pwInput.value
@@ -892,8 +606,20 @@ export function initApp(root: HTMLDivElement) {
       }
       const onCancel = () => { cleanup(); resolve(null) }
       const onKey = (e: KeyboardEvent) => {
-        if (e.key === 'Enter') { e.preventDefault(); onOk() }
+        // Keep keys inside the dialog from reaching page-level handlers.
+        e.stopPropagation()
+        // Enter submits from the password fields; on a focused button it
+        // activates that button (so Enter on Cancel cancels).
+        if (e.key === 'Enter' && e.target instanceof HTMLInputElement) { e.preventDefault(); onOk() }
         else if (e.key === 'Escape') { e.preventDefault(); onCancel() }
+        else if (e.key === 'Tab') {
+          // Trap focus within the dialog.
+          const focusable = [pwInput, pwConfirm, pwCancel, pwOk]
+          const i = focusable.indexOf(document.activeElement as HTMLInputElement & HTMLButtonElement)
+          const next = e.shiftKey ? (i <= 0 ? focusable.length - 1 : i - 1) : (i + 1) % focusable.length
+          e.preventDefault()
+          focusable[next].focus()
+        }
       }
       const onBackdrop = (e: MouseEvent) => { if (e.target === pwModal) onCancel() }
 
@@ -905,32 +631,39 @@ export function initApp(root: HTMLDivElement) {
   }
 
   btnDownload.addEventListener('click', async () => {
-    if (!lastFound) return
+    const current = found
+    if (!current) return
     const password = await promptPassword()
-    if (!password) return
+    if (!password || found !== current) return
 
     const prevText = btnDownload.textContent
     btnDownload.disabled = true
     btnDownload.textContent = 'Encrypting…'
     try {
-      const ks: KeystoreV3 = await createKeystoreV3(lastFound.priv, password)
+      const ks = await createKeystoreV3(current.priv, password)
       const blob = new Blob([JSON.stringify(ks, null, 2)], { type: 'application/json' })
       const a = document.createElement('a')
       a.href = URL.createObjectURL(blob)
-      a.download = `${lastFound.walletAddress}.json`
+      a.download = `${current.walletAddress}.json`
       a.click()
-      URL.revokeObjectURL(a.href)
+      // Some browsers drop the download if the URL is revoked too soon.
+      setTimeout(() => URL.revokeObjectURL(a.href), 60_000)
+      current.exported = true
+    } catch (err) {
+      console.error('[vanity] keystore export failed', err)
+      showWarning('Could not create the keystore file. Your key is still shown above — try again or reveal it.')
     } finally {
       btnDownload.disabled = false
       btnDownload.textContent = prevText
     }
   })
 
-  const copyDonate = root.querySelector<HTMLButtonElement>('#copy-donate')!
+  const copyDonate = $<HTMLButtonElement>('copy-donate')
   copyDonate.addEventListener('click', () => {
-    void copyToClipboard('0x99999933F17A1339958d50b3f59740E5Ad48C74C', copyDonate)
+    void copyToClipboard(DONATE_ADDRESS, copyDonate)
   })
 
   // Initialize
+  maskKey()
   updatePreview()
 }

@@ -1,135 +1,22 @@
-import { Point, utils, getPublicKey } from '@noble/secp256k1'
-import { keccak_256 } from '@noble/hashes/sha3.js'
-import { firstContractAddressFromWalletHex } from '../wallet/ethAddress'
-import type { SearchTarget } from '../searchTarget'
+import { searchBatch, type CpuSearchJob } from './cpuSearch'
 
 /**
  * SECURITY MODEL:
- * - Randomness: Uses crypto.getRandomValues() (OS-level CSPRNG) via @noble/secp256k1
- * - Key Generation: FIPS 186 B.4.1 compliant with modulo bias elimination
- * - Incremental Search: Each batch starts from a fresh 256-bit random key
- * - Verification: Found keys are re-verified before returning to prevent any bugs
- *
- * The incremental approach (k, k+1, k+2...) is safe because:
- * 1. ECDLP: Cannot derive private key from public key/address
- * 2. Only ONE key per batch is ever returned to user
- * 3. Each batch has independent random starting point
+ * - Randomness: every batch starts from a fresh key from crypto.getRandomValues()
+ *   (OS CSPRNG) via @noble/secp256k1's randomSecretKey (rejection-sampled, no bias).
+ * - Within a batch, keys are k, k±1, k±2, ... which is safe: recovering any of
+ *   them from an address is the discrete-log problem, and only the one matching
+ *   key is ever returned.
+ * - The main thread re-derives every returned key with @noble before showing it.
  */
 
-type WorkerMessage = {
-  type: 'search'
-  id: number
-  batchSize: number
-  prefixLower: string
-  suffixLower: string
-  target: SearchTarget
-}
+type SearchMessage = { id: number; job: CpuSearchJob; minPoints: number }
 
-type WorkerResult = {
-  type: 'result'
-  id: number
-  checked: number
-  found: { privHex: string; address: string } | null
-}
-
-// Precomputed hex lookup table for fast conversion
-const hexTable: string[] = new Array(256)
-for (let i = 0; i < 256; i++) {
-  hexTable[i] = i.toString(16).padStart(2, '0')
-}
-
-// Generator point and curve order for incremental key generation
-const G = Point.BASE
-const N = Point.CURVE().n
-
-function pubkeyToAddress(pubkey64: Uint8Array): string {
-  const hash = keccak_256(pubkey64)
-  let addr = ''
-  for (let i = 12; i < 32; i++) {
-    addr += hexTable[hash[i]]
+self.onmessage = (e: MessageEvent<SearchMessage>) => {
+  const { id, job, minPoints } = e.data
+  try {
+    self.postMessage({ id, ...searchBatch(job, minPoints) })
+  } catch (err) {
+    self.postMessage({ id, error: err instanceof Error ? err.message : String(err) })
   }
-  return addr
-}
-
-function bigIntToHex(n: bigint): string {
-  return n.toString(16).padStart(64, '0')
-}
-
-function bigIntToBytes(n: bigint): Uint8Array {
-  const bytes = new Uint8Array(32)
-  let temp = n
-  for (let i = 31; i >= 0; i--) {
-    bytes[i] = Number(temp & 0xffn)
-    temp >>= 8n
-  }
-  return bytes
-}
-
-self.onmessage = (e: MessageEvent<WorkerMessage>) => {
-  const { type, id, batchSize, prefixLower, suffixLower, target } = e.data
-
-  if (type !== 'search') return
-  const searchTarget: SearchTarget = target === 'first-contract' ? 'first-contract' : 'wallet'
-
-  // Generate random starting private key using CSPRNG
-  const privBytes = utils.randomSecretKey()
-  let privKey = bytesToBigInt(privBytes)
-
-  // Compute initial public key point (one full scalar multiplication)
-  let pubPoint = Point.fromBytes(getPublicKey(privBytes, false))
-
-  for (let i = 0; i < batchSize; i++) {
-    // Convert point to uncompressed public key (64 bytes, no prefix)
-    const pubRaw = pubPoint.toBytes(false)
-    const pub64 = pubRaw.slice(1)
-    const walletAddr = pubkeyToAddress(pub64)
-    const targetAddr = searchTarget === 'first-contract'
-      ? firstContractAddressFromWalletHex(walletAddr)
-      : walletAddr
-
-    if (targetAddr.startsWith(prefixLower) && targetAddr.endsWith(suffixLower)) {
-      // SECURITY: Re-verify the key before returning
-      // Recompute public key from private key to ensure correctness
-      const verifyPub = getPublicKey(bigIntToBytes(privKey), false)
-      const verifyWalletAddr = pubkeyToAddress(verifyPub.slice(1))
-      const verifyTargetAddr = searchTarget === 'first-contract'
-        ? firstContractAddressFromWalletHex(verifyWalletAddr)
-        : verifyWalletAddr
-
-      if (verifyTargetAddr !== targetAddr) {
-        // Should never happen - indicates a bug
-        console.error('Key verification failed!')
-        continue
-      }
-
-      const result: WorkerResult = {
-        type: 'result',
-        id,
-        checked: i + 1,
-        found: { privHex: bigIntToHex(privKey), address: '0x' + targetAddr }
-      }
-      self.postMessage(result)
-      return
-    }
-
-    // Increment: add G to public key and +1 to private key (MUCH faster than full scalar mult)
-    pubPoint = pubPoint.add(G)
-    privKey = (privKey + 1n) % N
-  }
-
-  const result: WorkerResult = {
-    type: 'result',
-    id,
-    checked: batchSize,
-    found: null
-  }
-  self.postMessage(result)
-}
-
-function bytesToBigInt(bytes: Uint8Array): bigint {
-  let result = 0n
-  for (let i = 0; i < bytes.length; i++) {
-    result = (result << 8n) | BigInt(bytes[i])
-  }
-  return result
 }

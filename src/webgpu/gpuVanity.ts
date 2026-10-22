@@ -1,13 +1,35 @@
-import shaderSource from './secp256k1.wgsl?raw'
+import { buildShader, resultsBufferBytes, RESULT_WORDS, RESULTS_HEADER_WORDS, type KernelConfig } from './shader'
+import {
+  addressWordsToHex, bigIntToHex32, buildCombTable, buildSearchTable, CURVE_ORDER, randomScalars, walkerPrivateKey,
+} from './precompute'
+import { deriveWalletAddressFromPriv } from '../vanityResult'
+import { firstContractAddressFromWalletHex } from '../wallet/ethAddress'
+import { hexToBytes } from '../utils/hex'
+import type { PrivKey32 } from '../wallet/keys'
 
-export type GpuVanityResult = {
-  privHex: string
-  addressHex: string
+export type GpuSearchJob = {
+  /** Address-word mask/value from patternToMask(). */
+  mask: Uint32Array
+  value: Uint32Array
+  /** 0 = wallet address, 1 = first CREATE contract address. */
+  mode: number
 }
+
+/** A point whose (lowercase) address matched the mask. Callers must still verify it. */
+export type GpuHit = { privHex: string; addressHex: string }
+
+export type GpuStep = { checked: number; hits: GpuHit[] }
 
 export type GpuVanity = {
   label: string
-  search(prefixNibbles: number[], suffixNibbles: number[], batchSize: number, searchMode: number): Promise<GpuVanityResult | null>
+  /** Begin a search with fresh random walkers. The engine must be idle (see drain). */
+  start(job: GpuSearchJob): void
+  /** Keep the GPU queue full and resolve with the next finished dispatch. */
+  step(): Promise<GpuStep>
+  /** Wait for in-flight work to finish so the engine is idle again. */
+  drain(): Promise<void>
+  /** Known-answer test on this device. Resolves to null on success, else a reason. */
+  selfTest(): Promise<string | null>
   destroy(): void
 }
 
@@ -19,39 +41,18 @@ export type GpuVanityPool = {
   destroy(): void
 }
 
-// Little-endian u32 array to hex (for hash output)
-function u32ArrayToHexLE(arr: Uint32Array, start: number, count: number): string {
-  let hex = ''
-  for (let i = 0; i < count; i++) {
-    const val = arr[start + i]
-    hex += (val & 0xff).toString(16).padStart(2, '0')
-    hex += ((val >> 8) & 0xff).toString(16).padStart(2, '0')
-    hex += ((val >> 16) & 0xff).toString(16).padStart(2, '0')
-    hex += ((val >> 24) & 0xff).toString(16).padStart(2, '0')
-  }
-  return hex
-}
-
-// Little-endian limbs to big-endian hex (for private key)
-function u32ArrayToHexBE(arr: Uint32Array, start: number, count: number): string {
-  let hex = ''
-  // Reverse limb order and byte order
-  for (let i = count - 1; i >= 0; i--) {
-    const val = arr[start + i]
-    hex += ((val >> 24) & 0xff).toString(16).padStart(2, '0')
-    hex += ((val >> 16) & 0xff).toString(16).padStart(2, '0')
-    hex += ((val >> 8) & 0xff).toString(16).padStart(2, '0')
-    hex += (val & 0xff).toString(16).padStart(2, '0')
-  }
-  return hex
-}
-
-const MAX_BATCH_SIZE = 32768
+export const DEFAULT_KERNEL_CONFIG: KernelConfig = { workgroupSize: 64, tableSize: 63, maxResults: 1024, mulRows: 1 }
+const MAX_WALKERS = 65536
+const MAX_IN_FLIGHT = 2
+const SLOTS = MAX_IN_FLIGHT + 1
+// Keep each dispatch short: the GPU is shared with the compositor (long
+// dispatches make the page stutter) and the OS kills devices whose work runs
+// for ~2 s. The window of walkers per dispatch adapts toward this target.
+const TARGET_DISPATCH_MS = 30
+const INITIAL_WINDOW = 512
 
 // Build a short, human-readable label from a GPUAdapter's info.
 function adapterLabel(adapter: GPUAdapter, index: number): string {
-  // `info` is the modern synchronous accessor; older browsers exposed
-  // `requestAdapterInfo()` instead. Either way we degrade gracefully.
   const info = (adapter as { info?: GPUAdapterInfo }).info
   if (info) {
     const name = info.description || [info.vendor, info.architecture].filter(Boolean).join(' ')
@@ -72,10 +73,16 @@ function adapterKey(adapter: GPUAdapter, index: number): string {
   return `adapter-${index}`
 }
 
+function isFallbackAdapter(adapter: GPUAdapter): boolean {
+  const a = adapter as { info?: { isFallbackAdapter?: boolean }; isFallbackAdapter?: boolean }
+  return Boolean(a.info?.isFallbackAdapter ?? a.isFallbackAdapter)
+}
+
 // Discover the distinct physical GPUs the browser is willing to expose.
 // WebGPU has no "enumerate all adapters" API — the only lever is
-// powerPreference, which on multi-GPU machines surfaces different chips.
-export async function enumerateGpuAdapters(): Promise<GPUAdapter[]> {
+// powerPreference, which on multi-GPU machines surfaces different chips
+// (except on Windows, where Chrome currently ignores it).
+export async function enumerateGpuAdapters(allowFallback = false): Promise<GPUAdapter[]> {
   if (!navigator.gpu) throw new Error('WebGPU not supported')
 
   const prefs: GPUPowerPreference[] = ['high-performance', 'low-power']
@@ -90,185 +97,305 @@ export async function enumerateGpuAdapters(): Promise<GPUAdapter[]> {
       adapter = null
     }
     if (!adapter) continue
+    // A software rasterizer would be slower than the CPU workers.
+    if (!allowFallback && isFallbackAdapter(adapter)) continue
     const key = adapterKey(adapter, adapters.length)
     if (seen.has(key)) continue
     seen.add(key)
     adapters.push(adapter)
   }
 
-  // Fallback: a default request if powerPreference yielded nothing.
-  if (adapters.length === 0) {
-    const adapter = await navigator.gpu.requestAdapter()
-    if (adapter) adapters.push(adapter)
-  }
-
   return adapters
 }
 
-export async function createGpuVanity(adapter?: GPUAdapter, label?: string): Promise<GpuVanity> {
-  if (!navigator.gpu) throw new Error('WebGPU not supported')
+type Slot = {
+  searchParams: GPUBuffer
+  initParams: GPUBuffer
+  results: GPUBuffer
+  readback: GPUBuffer
+  searchBind: GPUBindGroup
+  initBind: GPUBindGroup
+}
 
-  const resolvedAdapter = adapter ?? await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' })
-  if (!resolvedAdapter) throw new Error('No WebGPU adapter')
-  const resolvedLabel = label ?? adapterLabel(resolvedAdapter, 0)
+type Dispatch = {
+  slot: Slot
+  walkers: number
+  done: Promise<void>
+  submittedAt: number
+  scalars: Uint32Array
+}
 
-  const device = await resolvedAdapter.requestDevice()
+type Job = GpuSearchJob & { scalars: Uint32Array }
 
-  // Surface device-loss for diagnostics. An in-flight search will reject when the
-  // device is lost, which the caller's error handler turns into UI recovery.
+export async function createGpuVanity(
+  adapter: GPUAdapter,
+  label = adapterLabel(adapter, 0),
+  overrides: Partial<KernelConfig> = {},
+): Promise<GpuVanity> {
+  const CONFIG: KernelConfig = { ...DEFAULT_KERNEL_CONFIG, ...overrides }
+  const POINTS_PER_WALKER = 2 * CONFIG.tableSize + 1
+  const device = await adapter.requestDevice()
+
   let destroyed = false
+  // An in-flight mapAsync rejects when the device is lost; callers turn that
+  // into a fallback. Log the reason for diagnostics.
   void device.lost.then((info) => {
-    if (!destroyed) console.warn(`[vanity] WebGPU device "${resolvedLabel}" lost: ${info.reason ?? 'unknown'} — ${info.message}`)
+    if (!destroyed) console.warn(`[vanity] WebGPU device "${label}" lost: ${info.reason ?? 'unknown'} — ${info.message}`)
   })
 
-  const module = device.createShaderModule({ code: shaderSource })
+  const module = device.createShaderModule({ code: buildShader(CONFIG) })
+  const compileErrors = (await module.getCompilationInfo()).messages.filter(m => m.type === 'error')
+  if (compileErrors.length) {
+    device.destroy()
+    throw new Error('WGSL compile failed: ' + compileErrors.map(e => `${e.lineNum}:${e.linePos} ${e.message}`).join('; '))
+  }
+  // Async pipeline creation keeps the (large) shader compile off the main thread.
+  const [searchPipeline, initPipeline] = await Promise.all([
+    device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'search' } }),
+    device.createComputePipelineAsync({ layout: 'auto', compute: { module, entryPoint: 'init' } }),
+  ])
 
-  const pipeline = device.createComputePipeline({
-    layout: 'auto',
-    compute: { module, entryPoint: 'main' }
-  })
+  const STORAGE = GPUBufferUsage.STORAGE
+  const walkersBuf = device.createBuffer({ size: MAX_WALKERS * 16 * 4, usage: STORAGE })
+  const countersBuf = device.createBuffer({ size: MAX_WALKERS * 4, usage: STORAGE })
+  const scalarsBuf = device.createBuffer({ size: MAX_WALKERS * 8 * 4, usage: STORAGE | GPUBufferUsage.COPY_DST })
+  const table = buildSearchTable(CONFIG.tableSize)
+  const tableBuf = device.createBuffer({ size: table.byteLength, usage: STORAGE | GPUBufferUsage.COPY_DST })
+  device.queue.writeBuffer(tableBuf, 0, table)
+  const comb = buildCombTable()
+  const combBuf = device.createBuffer({ size: comb.byteLength, usage: STORAGE | GPUBufferUsage.COPY_DST })
+  device.queue.writeBuffer(combBuf, 0, comb)
 
-  // Params buffer
-  const paramsBuffer = device.createBuffer({
-    size: (4 + 40 + 40) * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-  })
-
-  // Pre-allocate seed buffer for max batch size
-  const seedBuffer = device.createBuffer({
-    size: MAX_BATCH_SIZE * 8 * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST
-  })
-
-  // Results buffer
-  const resultsSize = 274 * 4
-  const resultsBuffer = device.createBuffer({
-    size: resultsSize,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST
-  })
-
-  // Double-buffered readback
-  const readbackBuffers = [
-    device.createBuffer({ size: resultsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ }),
-    device.createBuffer({ size: resultsSize, usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ })
-  ]
-  let currentReadback = 0
-  let pendingMap: Promise<void> | null = null
-
-  // Pre-allocate seed data array
-  const seedData = new Uint32Array(MAX_BATCH_SIZE * 8)
-
-  // Reusable params array
-  const params = new Uint32Array(4 + 40 + 40)
-
-  async function search(
-    prefixNibbles: number[],
-    suffixNibbles: number[],
-    batchSize: number,
-    searchMode: number
-  ): Promise<GpuVanityResult | null> {
-    if (destroyed) throw new Error('GPU vanity destroyed')
-    if (batchSize > MAX_BATCH_SIZE) batchSize = MAX_BATCH_SIZE
-
-    // Generate random seeds (chunked for 65536 byte limit)
-    const seedView = seedData.subarray(0, batchSize * 8)
-    const maxU32s = 65536 / 4
-    for (let offset = 0; offset < seedView.length; offset += maxU32s) {
-      const chunk = seedView.subarray(offset, Math.min(offset + maxU32s, seedView.length))
-      crypto.getRandomValues(chunk)
-    }
-    device.queue.writeBuffer(seedBuffer, 0, seedView)
-
-    // Pack params
-    params[0] = batchSize
-    params[1] = prefixNibbles.length
-    params[2] = suffixNibbles.length
-    params[3] = searchMode
-    for (let i = 0; i < prefixNibbles.length; i++) params[4 + i] = prefixNibbles[i]
-    for (let i = 0; i < suffixNibbles.length; i++) params[44 + i] = suffixNibbles[i]
-    device.queue.writeBuffer(paramsBuffer, 0, params)
-
-    // Clear results counter
-    device.queue.writeBuffer(resultsBuffer, 0, new Uint32Array([0]))
-
-    const bindGroup = device.createBindGroup({
-      layout: pipeline.getBindGroupLayout(0),
+  const resultsBytes = resultsBufferBytes(CONFIG)
+  const slots: Slot[] = Array.from({ length: SLOTS }, () => {
+    const searchParams = device.createBuffer({ size: 80, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    const initParams = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST })
+    const results = device.createBuffer({ size: resultsBytes, usage: STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST })
+    const readback = device.createBuffer({ size: resultsBytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST })
+    const searchBind = device.createBindGroup({
+      layout: searchPipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: seedBuffer } },
-        { binding: 1, resource: { buffer: paramsBuffer } },
-        { binding: 2, resource: { buffer: resultsBuffer } }
-      ]
+        { binding: 0, resource: { buffer: searchParams } },
+        { binding: 1, resource: { buffer: walkersBuf } },
+        { binding: 2, resource: { buffer: countersBuf } },
+        { binding: 3, resource: { buffer: tableBuf } },
+        { binding: 4, resource: { buffer: results } },
+      ],
     })
+    const initBind = device.createBindGroup({
+      layout: initPipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 1, resource: { buffer: walkersBuf } },
+        { binding: 2, resource: { buffer: countersBuf } },
+        { binding: 5, resource: { buffer: initParams } },
+        { binding: 6, resource: { buffer: scalarsBuf } },
+        { binding: 7, resource: { buffer: combBuf } },
+      ],
+    })
+    return { searchParams, initParams, results, readback, searchBind, initBind }
+  })
 
+  let job: Job | null = null
+  let initialized = 0 // walkers [0, initialized) hold the current job's start points
+  let cursor = 0
+  let window = INITIAL_WINDOW
+  let nextSlot = 0
+  let lastDoneAt = 0
+  const inflight: Dispatch[] = []
+  const searchParamData = new Uint32Array(20)
+  const initParamData = new Uint32Array(4)
+  const WG = CONFIG.workgroupSize
+
+  function submit(base: number, count: number): void {
+    const j = job!
+    const slot = slots[nextSlot]
+    nextSlot = (nextSlot + 1) % SLOTS
     const encoder = device.createCommandEncoder()
+    encoder.clearBuffer(slot.results, 0, RESULTS_HEADER_WORDS * 4)
+
+    // Walkers are seeded lazily on their first visit, so a small GPU that only
+    // ever needs a few thousand of them never pays to initialize the rest.
+    if (initialized < base + count) {
+      const from = Math.max(initialized, base)
+      initParamData[0] = from
+      initParamData[1] = base + count - from
+      initParamData[2] = 8 / CONFIG.mulRows
+      device.queue.writeBuffer(slot.initParams, 0, initParamData)
+      const pass = encoder.beginComputePass()
+      pass.setPipeline(initPipeline)
+      pass.setBindGroup(0, slot.initBind)
+      pass.dispatchWorkgroups(Math.ceil((base + count - from) / WG))
+      pass.end()
+      initialized = base + count
+    }
+
+    searchParamData.fill(0)
+    searchParamData[0] = base
+    searchParamData[1] = count
+    searchParamData[2] = j.mode
+    searchParamData[3] = 8 / CONFIG.mulRows
+    searchParamData.set(j.mask, 4)
+    searchParamData.set(j.value, 12)
+    device.queue.writeBuffer(slot.searchParams, 0, searchParamData)
     const pass = encoder.beginComputePass()
-    pass.setPipeline(pipeline)
-    pass.setBindGroup(0, bindGroup)
-    pass.dispatchWorkgroups(Math.ceil(batchSize / 256))
+    pass.setPipeline(searchPipeline)
+    pass.setBindGroup(0, slot.searchBind)
+    pass.dispatchWorkgroups(Math.ceil(count / WG))
     pass.end()
 
-    // Use double buffering
-    const readbackBuffer = readbackBuffers[currentReadback]
-    currentReadback = 1 - currentReadback
-
-    // Wait for any pending map from previous iteration
-    if (pendingMap) {
-      await pendingMap
-      pendingMap = null
-    }
-
-    encoder.copyBufferToBuffer(resultsBuffer, 0, readbackBuffer, 0, resultsSize)
+    encoder.copyBufferToBuffer(slot.results, 0, slot.readback, 0, resultsBytes)
     device.queue.submit([encoder.finish()])
+    const done = slot.readback.mapAsync(GPUMapMode.READ)
+    done.catch(() => {}) // observed by step()/drain(); avoid unhandled-rejection noise
+    inflight.push({ slot, walkers: count, done, submittedAt: performance.now(), scalars: j.scalars })
+  }
 
-    await readbackBuffer.mapAsync(GPUMapMode.READ)
-    const resultData = new Uint32Array(readbackBuffer.getMappedRange().slice(0))
-    readbackBuffer.unmap()
+  function submitNext(): void {
+    const count = Math.min(window, MAX_WALKERS - cursor)
+    submit(cursor, count)
+    cursor = cursor + count >= MAX_WALKERS ? 0 : cursor + count
+  }
 
-    const count = resultData[0]
-    if (count > 0) {
-      const base = 1
-      const privHex = u32ArrayToHexBE(resultData, base, 8)  // Big-endian for wallet import
-      const hashHex = u32ArrayToHexLE(resultData, base + 8, 8)
-      const addressHex = hashHex.slice(24)
-      return { privHex, addressHex }
+  // Read a finished dispatch's results and release its readback buffer.
+  async function collect(d: Dispatch): Promise<{ hits: GpuHit[]; raw: number }> {
+    await d.done
+    const words = new Uint32Array(d.slot.readback.getMappedRange()).slice()
+    d.slot.readback.unmap()
+    const raw = words[0]
+    const n = Math.min(raw, CONFIG.maxResults)
+    const hits: GpuHit[] = []
+    for (let k = 0; k < n; k++) {
+      const o = RESULTS_HEADER_WORDS + k * RESULT_WORDS
+      const walker = words[o]
+      const offset = words[o + 1] | 0
+      const counter = words[o + 2]
+      const addressHex = addressWordsToHex(words.subarray(o + 3, o + 8))
+      // A corrupted entry yields an empty key, which verification rejects.
+      const valid = walker < MAX_WALKERS && Math.abs(offset) <= CONFIG.tableSize
+      const privHex = valid ? bigIntToHex32(walkerPrivateKey(d.scalars, walker, counter, offset, CONFIG.tableSize)) : ''
+      hits.push({ privHex, addressHex })
     }
+    return { hits, raw }
+  }
 
-    return null
+  function adapt(d: Dispatch, finishedAt: number): void {
+    const gpuMs = finishedAt - Math.max(lastDoneAt, d.submittedAt)
+    lastDoneAt = finishedAt
+    if (gpuMs <= 0) return
+    // Clamp relative to the current window, not this dispatch: the last
+    // dispatch of each sweep is truncated and must not drag the window down.
+    const ideal = (d.walkers * TARGET_DISPATCH_MS) / gpuMs
+    const next = Math.round(Math.min(window * 2, Math.max(window / 2, ideal)) / WG) * WG
+    window = Math.min(MAX_WALKERS, Math.max(WG, next))
+  }
+
+  async function step(): Promise<GpuStep> {
+    if (destroyed) throw new Error('GPU vanity destroyed')
+    if (!job) throw new Error('GPU search not started')
+    while (inflight.length < MAX_IN_FLIGHT) submitNext()
+    const d = inflight.shift()!
+    const { hits } = await collect(d)
+    adapt(d, performance.now())
+    return { checked: d.walkers * POINTS_PER_WALKER, hits }
+  }
+
+  async function drain(): Promise<void> {
+    const pending = inflight.splice(0)
+    await Promise.allSettled(pending.map(d => d.done))
+    for (const d of pending) if (d.slot.readback.mapState === 'mapped') d.slot.readback.unmap()
+  }
+
+  function start(next: GpuSearchJob): void {
+    if (destroyed) throw new Error('GPU vanity destroyed')
+    if (inflight.length) throw new Error('GPU search still running; drain() first')
+    // Fresh walkers for every search keeps keys from separate searches unrelated.
+    const scalars = randomScalars(MAX_WALKERS)
+    device.queue.writeBuffer(scalarsBuf, 0, scalars)
+    job = { ...next, mask: next.mask.slice(), value: next.value.slice(), scalars }
+    initialized = 0
+    cursor = 0
+    lastDoneAt = 0
+  }
+
+  // Known-answer test: four walkers whose keys include the extremes 1 and n-1,
+  // a match-everything pattern, and every reported point re-derived with
+  // @noble. Covers init, the batched inversion, both table directions, the
+  // advance step and both address modes on the user's actual GPU/driver.
+  async function selfTest(): Promise<string | null> {
+    if (inflight.length) throw new Error('GPU search still running; drain() first')
+    const m = CONFIG.tableSize
+    const scalars = randomScalars(4)
+    const setScalar = (i: number, v: bigint) => {
+      for (let l = 0; l < 8; l++) scalars[i * 8 + l] = Number((v >> BigInt(32 * l)) & 0xffffffffn)
+    }
+    setScalar(0, BigInt(m + 1))                                     // keys 1 ..
+    setScalar(3, CURVE_ORDER - 1n - BigInt(m) - BigInt(POINTS_PER_WALKER)) // .. n-1 on the 2nd pass
+    device.queue.writeBuffer(scalarsBuf, 0, scalars)
+    const zero = new Uint32Array(5)
+    initialized = 0
+
+    try {
+      for (const mode of [0, 1]) {
+        job = { mask: zero, value: zero, mode, scalars }
+        submit(0, 4)
+        const d = inflight.shift()!
+        const { hits, raw } = await collect(d)
+        const expected = 4 * POINTS_PER_WALKER
+        if (raw !== expected) return `mode ${mode}: expected ${expected} results, got ${raw}`
+        const seen = new Set<string>()
+        for (const h of hits) {
+          if (!h.privHex) return `mode ${mode}: corrupted result entry`
+          if (seen.has(h.privHex)) return `mode ${mode}: duplicate key`
+          seen.add(h.privHex)
+          const wallet = deriveWalletAddressFromPriv(hexToBytes(h.privHex) as PrivKey32).slice(2).toLowerCase()
+          const want = mode === 1 ? firstContractAddressFromWalletHex(wallet) : wallet
+          if (want !== h.addressHex) return `mode ${mode}: key ${h.privHex} -> ${want}, GPU said ${h.addressHex}`
+        }
+      }
+      return null
+    } catch (err) {
+      return err instanceof Error ? err.message : String(err)
+    } finally {
+      await drain()
+      job = null
+      initialized = 0
+    }
   }
 
   function destroy() {
+    if (destroyed) return
     destroyed = true
-    paramsBuffer.destroy()
-    seedBuffer.destroy()
-    resultsBuffer.destroy()
-    readbackBuffers[0].destroy()
-    readbackBuffers[1].destroy()
-    device.destroy()
+    job = null
+    device.destroy() // also releases every buffer
   }
 
-  return { label: resolvedLabel, search, destroy }
+  return { label, start, step, drain, selfTest, destroy }
 }
 
 // Create one independent GpuVanity instance per distinct physical GPU.
 // Falls back to a single instance when only one GPU is available.
-export async function createGpuVanityPool(): Promise<GpuVanityPool> {
-  const adapters = await enumerateGpuAdapters()
+export async function createGpuVanityPool(
+  opts: { allowFallbackAdapter?: boolean; kernel?: Partial<KernelConfig> } = {},
+): Promise<GpuVanityPool> {
+  const adapters = await enumerateGpuAdapters(opts.allowFallbackAdapter)
   if (adapters.length === 0) throw new Error('No WebGPU adapter')
 
   const instances: GpuVanity[] = []
   const labels: string[] = []
+  const errors: string[] = []
 
   for (let i = 0; i < adapters.length; i++) {
     try {
-      const inst = await createGpuVanity(adapters[i], adapterLabel(adapters[i], i))
+      const inst = await createGpuVanity(adapters[i], adapterLabel(adapters[i], i), opts.kernel)
       instances.push(inst)
       labels.push(inst.label)
-    } catch {
+    } catch (err) {
       // Skip a GPU whose device creation failed; others may still work.
+      errors.push(err instanceof Error ? err.message : String(err))
     }
   }
 
-  if (instances.length === 0) throw new Error('Failed to create any GPU device')
+  if (instances.length === 0) throw new Error('Failed to create any GPU device: ' + errors.join('; '))
 
   return {
     instances,
