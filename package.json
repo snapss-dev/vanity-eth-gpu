@@ -9,7 +9,7 @@
     "preview": "vite preview",
     "test": "vitest run",
     "test:gpu": "node scripts/gpu-test.mjs",
-    "icons": "node scripts/build-icons.mjs"
+    "images": "node scripts/build-images.mjs"
   },
   "devDependencies": {
     "@webgpu/types": "^0.1.68",
