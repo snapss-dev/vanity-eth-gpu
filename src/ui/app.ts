@@ -174,7 +174,7 @@ export function initApp(root: HTMLDivElement) {
 
     <footer class="footer">
       <div>All computations run locally in your browser. For maximum security, disconnect from the internet before generating.</div>
-      <div class="built-by">Built by <a href="https://x.com/snapss" target="_blank" rel="noopener">@snapss</a> & <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a></div>
+      <div class="built-by">Built by <a href="https://x.com/snapsnocaps" target="_blank" rel="noopener">@snapsnocaps</a> & <a href="https://claude.ai" target="_blank" rel="noopener">Claude</a></div>
       <div class="open-source"><a href="https://github.com/HODL-Community/vanity-eth-gpu" target="_blank" rel="noopener">Open Source</a> on GitHub</div>
       <div class="donate">Donate: <span class="donate-addr">${DONATE_ADDRESS}</span><button class="copy-btn-small" id="copy-donate">Copy</button></div>
     </footer>
